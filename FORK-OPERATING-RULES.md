@@ -35,6 +35,17 @@ will refuse to fast-forward and stop — by design. It will not force.
 
 `custom` is what the runtime actually runs.
 
+### `custom` is the default branch, on purpose
+
+GitHub only registers `schedule` and `workflow_dispatch` triggers from a
+repository's **default branch**. With `main` as the default, the sync workflow
+would never fire, and the only fix would be to commit it to `main` -- breaking
+the mirror and guaranteeing a conflict with upstream on every single sync.
+
+So the fork's default branch is `custom`. `main` stays a pure mirror that we
+never write to by hand. This also means pull requests open against `custom` by
+default, which is what we want: nothing should ever target the mirror.
+
 ## Where customizations live
 
 Prefer `plugins/model-providers/` and other plugin directories. Upstream treats
