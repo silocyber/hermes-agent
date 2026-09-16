@@ -53,6 +53,31 @@ class CustomProfile(ProviderProfile):
                 top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
         return extra_body, top_level
 
+    def get_max_tokens(self, model: str | None) -> int | None:
+        """Honor an explicit per-model ``max_output_tokens`` before the profile default.
+
+        A custom endpoint is whatever the operator pointed it at, so no single
+        client-side cap is right for all of them. Where the operator has stated
+        one for a specific model, send it; otherwise fall through to the profile
+        default, which is ``None`` here -- the endpoint owns its own generation
+        default (#39281 removed the 65536 floor).
+
+        Resolution order:
+          1. explicit ``model_overrides.<provider>.<model>.max_output_tokens``
+          2. ``self.default_max_tokens``
+        """
+        if model:
+            try:
+                from agent.models_dev import _explicit_model_override
+
+                override = _explicit_model_override(self.name, model) or {}
+                value = override.get("max_output_tokens")
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                    return int(value)
+            except Exception:  # a metadata lookup must never fail a request
+                pass
+        return self.default_max_tokens
+
     def fetch_models(
         self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
     ) -> list[str] | None:
