@@ -1,0 +1,216 @@
+# Sync upstream (NousResearch/hermes-agent) into this fork.
+#
+# Two independent stages, deliberately separated:
+#
+#   1. mirror  — fast-forward `main` to `upstream/main`. `main` is a pure
+#                mirror of upstream and carries none of our changes, so this
+#                push can always be a fast-forward. If it ever cannot be, the
+#                push is REJECTED rather than forced: that means somebody
+#                committed to `main` by mistake, and a human must look.
+#
+#   2. propose — rebase `custom` onto the refreshed `main` on a NEW branch and
+#                open a pull request into `custom`.
+#
+# HARD RULE: this workflow never force-pushes and never writes to `custom`.
+# Every change to `custom` arrives as a reviewable pull request. A silent
+# rebase that dropped our customizations would leave the branch looking
+# maintained while the behavior it exists to provide was gone — which is the
+# exact failure this fork was created to prevent.
+#
+# HARD RULE: this workflow never pushes to NousResearch/hermes-agent. The
+# upstream remote is added fetch-only, with its push URL disabled.
+#
+# Merge the resulting PR with "Rebase and merge" to keep `custom` a legible
+# patch series on top of upstream.
+name: Sync from upstream
+
+on:
+  schedule:
+    # Daily at 06:00 UTC.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/NousResearch/hermes-agent.git
+  CUSTOM_BRANCH: custom
+
+jobs:
+  sync:
+    name: Mirror main, propose custom rebase
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          # SYNC_PAT, not GITHUB_TOKEN: a pull request opened with GITHUB_TOKEN
+          # does not trigger other workflows, so upstream CI would never run on
+          # the sync PR and we would be merging unverified upstream code.
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "silocyber-sync[bot]"
+          git config user.email "silocyber-sync@users.noreply.github.com"
+
+      - name: Add upstream remote (fetch-only)
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM"
+          # Belt and braces: make a push to upstream impossible from this job.
+          git remote set-url --push upstream DISABLED_never_push_to_upstream
+          git fetch upstream --prune --tags
+          git remote -v
+
+      - name: Fast-forward main to upstream/main
+        id: mirror
+        run: |
+          set -euo pipefail
+          before="$(git rev-parse origin/main)"
+          after="$(git rev-parse upstream/main)"
+          if [ "$before" = "$after" ]; then
+            echo "main already current at $after"
+          elif git merge-base --is-ancestor "$before" "$after"; then
+            # Plain (non-force) push. Git rejects it unless it fast-forwards.
+            git push origin "$after:refs/heads/main"
+            echo "main fast-forwarded $before -> $after"
+          else
+            echo "::error::origin/main is not an ancestor of upstream/main."
+            echo "::error::Someone committed to the mirror branch. Refusing to force. A human must reconcile."
+            exit 1
+          fi
+          echo "upstream_head=$after" >> "$GITHUB_OUTPUT"
+
+      - name: Does custom need the rebase?
+        id: need
+        run: |
+          set -euo pipefail
+          git fetch origin --prune
+          if ! git rev-parse --verify "origin/$CUSTOM_BRANCH" >/dev/null 2>&1; then
+            echo "::notice::branch '$CUSTOM_BRANCH' does not exist yet; nothing to propose."
+            echo "needed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          behind="$(git rev-list --count "origin/$CUSTOM_BRANCH..${{ steps.mirror.outputs.upstream_head }}")"
+          echo "custom is $behind commit(s) behind upstream"
+          [ "$behind" -gt 0 ] && echo "needed=true" >> "$GITHUB_OUTPUT" || echo "needed=false" >> "$GITHUB_OUTPUT"
+
+      # Record what `custom` actually adds on top of upstream BEFORE we touch
+      # anything. This set is the whole reason the fork exists; if a rebase
+      # empties it, the rebase silently discarded our work.
+      - name: Record our divergence from upstream
+        id: before
+        if: steps.need.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$CUSTOM_BRANCH" "origin/main")"
+          git diff --name-only "$base" "origin/$CUSTOM_BRANCH" | sort > /tmp/custom-files-before.txt
+          count="$(wc -l < /tmp/custom-files-before.txt | tr -d ' ')"
+          echo "custom changes $count file(s) relative to its upstream base:"
+          cat /tmp/custom-files-before.txt
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase custom onto refreshed main (on a throwaway branch)
+        id: rebase
+        if: steps.need.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          BRANCH="sync/upstream-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          # Never check out `custom` itself — work on a new ref only.
+          git checkout -B "$BRANCH" "origin/$CUSTOM_BRANCH"
+          if git rebase "${{ steps.mirror.outputs.upstream_head }}"; then
+            echo "outcome=clean" >> "$GITHUB_OUTPUT"
+          else
+            # Capture the conflict set, then abandon the attempt. We never push
+            # a tree containing conflict markers.
+            git diff --name-only --diff-filter=U | sort > /tmp/conflicts.txt || true
+            echo "conflicting files:"; cat /tmp/conflicts.txt || true
+            git rebase --abort || true
+            echo "outcome=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The guard that matters. A clean rebase is not the same as a correct
+      # one: upstream can delete or rewrite the file we patch, and git will
+      # resolve that without complaint, leaving a branch that looks healthy
+      # and does nothing.
+      - name: Verify our customizations survived the rebase
+        if: steps.rebase.outputs.outcome == 'clean'
+        run: |
+          set -euo pipefail
+          git diff --name-only "${{ steps.mirror.outputs.upstream_head }}" HEAD | sort > /tmp/custom-files-after.txt
+          after="$(wc -l < /tmp/custom-files-after.txt | tr -d ' ')"
+          echo "before: ${{ steps.before.outputs.count }} file(s); after: $after file(s)"
+          if [ "${{ steps.before.outputs.count }}" -gt 0 ] && [ "$after" -eq 0 ]; then
+            echo "::error::The rebase eliminated every one of our changes. Refusing to propose it."
+            exit 1
+          fi
+          if ! diff -u /tmp/custom-files-before.txt /tmp/custom-files-after.txt; then
+            echo "::warning::The set of files we customize changed during the rebase (shown above). Review the PR carefully."
+          fi
+
+      - name: Push the proposal branch and open a PR
+        if: steps.rebase.outputs.outcome == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.rebase.outputs.branch }}"
+          # A brand-new ref: a plain push, never a force.
+          git push origin "HEAD:refs/heads/$BRANCH"
+          {
+            echo "\`$CUSTOM_BRANCH\` rebased onto \`upstream/main\` (\`${{ steps.mirror.outputs.upstream_head }}\`)."
+            echo
+            echo "The rebase applied cleanly and our customizations survived the survival check."
+            echo
+            echo "**Files this fork changes on top of upstream after the rebase:**"
+            echo
+            echo '```'
+            cat /tmp/custom-files-after.txt
+            echo '```'
+            echo
+            echo "Merge with **Rebase and merge** so \`$CUSTOM_BRANCH\` stays a legible patch series."
+            echo "Do not merge until CI is green — it is running upstream's own suite against the rebased tree."
+          } > /tmp/pr-body.md
+          gh pr create --base "$CUSTOM_BRANCH" --head "$BRANCH" \
+            --title "Sync upstream/main into $CUSTOM_BRANCH ($(date -u +%Y-%m-%d)) — clean rebase" \
+            --body-file /tmp/pr-body.md
+
+      - name: Open a conflict PR for manual resolution
+        if: steps.rebase.outputs.outcome == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.rebase.outputs.branch }}"
+          # The rebase was abandoned, so there is no resolved tree to offer.
+          # Push upstream's head as the proposal branch instead and let GitHub
+          # present the conflict against `custom`, where a human can resolve it
+          # in the PR or check the branch out locally. Nothing is forced and
+          # nothing half-merged is ever committed.
+          git push origin "${{ steps.mirror.outputs.upstream_head }}:refs/heads/$BRANCH"
+          {
+            echo "Rebasing \`$CUSTOM_BRANCH\` onto \`upstream/main\` (\`${{ steps.mirror.outputs.upstream_head }}\`) **conflicts**. Automation stopped here on purpose."
+            echo
+            echo "**Conflicting files:**"
+            echo
+            echo '```'
+            cat /tmp/conflicts.txt 2>/dev/null || echo "(conflict list unavailable)"
+            echo '```'
+            echo
+            echo "**Files this fork customizes — every one of these must still do its job after you resolve:**"
+            echo
+            echo '```'
+            cat /tmp/custom-files-before.txt 2>/dev/null || echo "(unavailable)"
+            echo '```'
+            echo
+            echo "Resolve in favor of upstream's refactor while preserving our behavior. Do not resolve by discarding our side, and do not resolve by reverting upstream."
+            echo
+            echo "If upstream has made a customization unnecessary — it fixed the same problem itself — say so and delete ours. A customization we no longer need is pure rebase cost."
+          } > /tmp/pr-body.md
+          gh pr create --base "$CUSTOM_BRANCH" --head "$BRANCH" \
+            --title "Sync upstream/main into $CUSTOM_BRANCH ($(date -u +%Y-%m-%d)) — CONFLICTS, manual resolution required" \
+            --body-file /tmp/pr-body.md
