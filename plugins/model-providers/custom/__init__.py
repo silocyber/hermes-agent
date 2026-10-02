@@ -9,6 +9,20 @@ from providers import register_provider
 from providers.base import ProviderProfile
 from utils import base_url_host_matches
 
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+
+def _fallback_output_cap() -> int:
+    """HERMES_FALLBACK_MAX_OUTPUT_TOKENS when it is a positive integer, else 16384."""
+    try:
+        value = int(os.environ.get("HERMES_FALLBACK_MAX_OUTPUT_TOKENS", "16384"))
+    except ValueError:
+        return 16384
+    return value if value > 0 else 16384
+
 
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
     """True only for explicit Ollama signatures (port 11434 or an ``ollama`` host label).
@@ -82,6 +96,31 @@ class CustomProfile(ProviderProfile):
             elif effort:
                 top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
         return extra_body, top_level
+
+    def get_max_tokens(self, model: str | None) -> int | None:
+        """Per-seat output cap (silocyber patch, VIGI-511).
+
+        Upstream fd3565deec stopped reading `max_output_tokens` from model_overrides, and this
+        profile sets no default_max_tokens, so a custom-provider seat would send no cap at all and
+        the endpoint's default would decide. This returns
+        model_overrides.<provider>.<model>.max_output_tokens when it is a positive number, else the
+        profile default (None: no cap, as upstream). A FAILED lookup never silently sends no cap:
+        it logs a warning and returns HERMES_FALLBACK_MAX_OUTPUT_TOKENS (default 16384).
+        """
+        if not model:
+            return self.default_max_tokens
+        try:
+            from agent.models_dev import _explicit_model_override
+            override = _explicit_model_override(self.name, model)
+        except Exception as exc:  # the lookup broke: cap conservatively and say so
+            fallback = _fallback_output_cap()
+            logger.warning("custom provider: max_output_tokens lookup failed for %s (%s); capping output at %d",
+                           model, exc, fallback)
+            return fallback
+        val = (override or {}).get("max_output_tokens")
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+            return self.default_max_tokens
+        return int(val)
 
     def fetch_models(
         self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
