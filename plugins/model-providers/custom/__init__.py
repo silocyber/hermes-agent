@@ -53,6 +53,32 @@ class CustomProfile(ProviderProfile):
                 top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
         return extra_body, top_level
 
+    def get_max_tokens(self, model: str | None) -> int | None:
+        """Per-seat max_tokens: check model_overrides before the profile default.
+
+        The static default_max_tokens (65536) is only a floor for Ollama
+        bare-metal endpoints that truncate without it (#39281).  Named custom
+        aliases registered through the LiteLLM gateway should respect their
+        own per-model cap so a generous floor never exceeds the served window.
+
+        Resolution order (matching the OpenCode Go pattern):
+          1. explicit model_overrides.<provider>.<model>.max_output_tokens
+          2. self.default_max_tokens (the generous Ollama floor)
+        """
+        if model:
+            try:
+                from agent.models_dev import _explicit_model_override
+                override = _explicit_model_override(self.name, model)
+                if override and "max_output_tokens" in override:
+                    val = override["max_output_tokens"]
+                    if isinstance(val, int) and val > 0:
+                        return val
+                    if isinstance(val, float) and val > 0:
+                        return int(val)
+            except Exception:
+                pass  # degrade to profile default on any lookup failure
+        return self.default_max_tokens
+
     def fetch_models(
         self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
     ) -> list[str] | None:
