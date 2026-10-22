@@ -1,6 +1,6 @@
 """Exa web search + content extraction via the ``exa-py`` SDK (lazy-installed).
 
-Env: ``EXA_API_KEY`` (https://exa.ai). Both methods are sync — Exa's SDK is
+Env: ``EXA_API_KEY`` (https://exa.ai); optional ``EXA_SEARCH_TYPE`` (per profile). Both methods are sync — Exa's SDK is
 sync-only; the dispatcher threads extract when the caller is async.
 """
 
@@ -42,8 +42,11 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
         def _body() -> Dict[str, Any]:
             if use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_search("Exa", "exa", query, limit, logger)
-            logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            response = _get_exa_client().search(query, num_results=limit, contents={"highlights": True})
+            # Per-profile search tier (e.g. Exa 3.0 "lite", $4/1K vs auto $7/1K); unset keeps Exa's default.
+            search_type = provider_env("EXA_SEARCH_TYPE")
+            logger.info("Exa search: '%s' (limit=%d, type=%s)", query, limit, search_type or "default")
+            kwargs = {"type": search_type} if search_type else {}
+            response = _get_exa_client().search(query, num_results=limit, contents={"highlights": True}, **kwargs)
             return search_ok([
                 web_hit(r.url or "", r.title or "", " ".join(r.highlights or []), i + 1)
                 for i, r in enumerate(response.results or [])
