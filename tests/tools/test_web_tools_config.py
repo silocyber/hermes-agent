@@ -473,7 +473,8 @@ class TestExaClientConfig:
                 self.api_key = api_key
                 self.headers = {}
 
-            def search(self, query, num_results, contents):
+            def search(self, query, num_results, contents, **kwargs):
+                Exa.last_kwargs = kwargs
                 hit = types.SimpleNamespace(url="https://example.com", title="t", highlights=[self.api_key])
                 return types.SimpleNamespace(results=[hit])
 
@@ -525,6 +526,31 @@ class TestExaClientConfig:
         result = ExaWebSearchProvider().search("q")
         assert result["success"], result
         assert result["data"]["web"][0]["description"] == "key-env"
+
+    def test_search_type_is_per_profile_and_unset_sends_none(self, tmp_path, monkeypatch):
+        """EXA_SEARCH_TYPE in one profile's .env (the scout on "lite") never leaks to another profile."""
+        from agent import secret_scope
+        from plugins.web.exa.provider import ExaWebSearchProvider
+        homes = {}
+        for name, env in (("scout", "EXA_API_KEY=k\nEXA_SEARCH_TYPE=lite\n"), ("researcher", "EXA_API_KEY=k\n")):
+            homes[name] = tmp_path / name
+            homes[name].mkdir()
+            (homes[name] / ".env").write_text(env)
+        monkeypatch.setattr("plugins.web.keyless_mcp.keyless_enabled", lambda: False)
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        exa_cls = sys.modules["exa_py"].Exa
+
+        def kwargs_for(name):
+            token = secret_scope.set_secret_scope(secret_scope.build_profile_secret_scope(homes[name]))
+            try:
+                assert ExaWebSearchProvider().search("q")["success"]
+            finally:
+                secret_scope.reset_secret_scope(token)
+            return exa_cls.last_kwargs
+
+        assert kwargs_for("scout") == {"type": "lite"}
+        assert kwargs_for("researcher") == {}
+        assert kwargs_for("scout") == {"type": "lite"}
 
 
 class TestWebSearchSchema:
