@@ -1,6 +1,7 @@
 """Session Insights Engine: aggregates the SQLite state DB into usage insights (tokens, cost estimates, tool/skill
 usage, activity, model/platform breakdowns). ``InsightsEngine(db).generate(days=30)`` → ``format_terminal(report)``."""
 
+import functools
 import json
 import sqlite3
 import time
@@ -26,6 +27,25 @@ def _fmt_est_cost(est_cost: float) -> str:
     return format_cost_label(Decimal(str(est_cost)))
 
 
+@functools.lru_cache(maxsize=16)
+def _endpoint_api_key(base_url: Optional[str]) -> Any:
+    """The configured custom provider's key for *base_url* (its key_env), so the pricing lookup's
+    /models probe authenticates; "" when no custom entry serves that URL. Session rows never store keys."""
+    if not base_url:
+        return ""
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider_custom import find_custom_provider_identity
+        from utils import base_url_hostname
+        identity = find_custom_provider_identity(base_url)
+        runtime = resolve_runtime_provider(requested=identity) if identity else {}
+        if base_url_hostname(runtime.get("base_url") or "") != base_url_hostname(base_url):
+            return ""
+        return runtime.get("api_key") or ""
+    except Exception:
+        return ""
+
+
 def _estimate_cost(session_or_model: Dict[str, Any] | str, input_tokens: int = 0, output_tokens: int = 0, *, cache_read_tokens: int = 0,
                    cache_write_tokens: int = 0, provider: Optional[str] = None, base_url: Optional[str] = None) -> tuple[float, str]:
     """Estimate the USD cost for a session row or a model/token tuple."""
@@ -37,7 +57,7 @@ def _estimate_cost(session_or_model: Dict[str, Any] | str, input_tokens: int = 0
     else:
         model = session_or_model or ""
         usage = CanonicalUsage(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
-    result = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+    result = estimate_usage_cost(model, usage, provider=provider, base_url=base_url, api_key=_endpoint_api_key(base_url))
     return float(result.amount_usd or 0.0), result.status
 
 
