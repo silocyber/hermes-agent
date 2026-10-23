@@ -64,6 +64,7 @@ def record_aux_usage(
         if raw_usage is None:
             return
 
+        from agent.auxiliary_client import _read_main_api_key_if_same_host
         from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
         usage = normalize_usage(raw_usage, provider=provider)
@@ -76,7 +77,9 @@ def record_aux_usage(
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
         try:
-            cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+            # Host-gated main key: without it the endpoint /models pricing probe goes out keyless (401 noise).
+            cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url,
+                                       api_key=_read_main_api_key_if_same_host(base_url or ""))
             if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
         except Exception:

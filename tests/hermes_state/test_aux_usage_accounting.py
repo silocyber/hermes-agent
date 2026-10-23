@@ -190,6 +190,26 @@ class TestAmbientAccountingContext:
         assert rows[0]["output_tokens"] == 20
 
 
+    def test_cost_estimate_gets_main_key_only_on_same_host(self, db, monkeypatch):
+        """The /models pricing probe behind estimate_usage_cost went out keyless (LiteLLM 401s)."""
+        import agent.usage_pricing as up
+        from agent.auxiliary_client import reset_runtime_main, set_runtime_main
+        from agent.aux_accounting import record_aux_usage, reset_accounting_context, set_accounting_context
+
+        seen = []
+        monkeypatch.setattr(up, "estimate_usage_cost", lambda *a, **k: seen.append(k.get("api_key")) or
+                            up.CostResult(amount_usd=None, status="unknown", source="none", label="n/a"))
+        db.create_session("s1", source="cli")
+        rt = set_runtime_main("custom", "m", base_url="http://localhost:4000/v1", api_key="sk-main")
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(_mk_response(), "title_generation", provider="custom", base_url="http://localhost:4000/v1")
+            record_aux_usage(_mk_response(), "vision", provider="custom", base_url="https://elsewhere.example/v1")
+        finally:
+            reset_accounting_context(token)
+            reset_runtime_main(rt)
+        assert seen == ["sk-main", ""]
+
     def test_moa_tasks_excluded(self, db):
         """MoA advisor usage is already folded into the main-loop delta by
         conversation_loop — recording it here would double-count."""

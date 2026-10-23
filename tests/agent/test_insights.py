@@ -153,6 +153,26 @@ class TestHasKnownPricing:
 
 
 class TestEstimateCost:
+    def test_endpoint_pricing_probe_carries_configured_key(self, monkeypatch):
+        """Session rows hold no key, so the /models pricing probe for a custom endpoint went out keyless."""
+        import agent.insights as ins
+        import hermes_cli.runtime_provider as rp
+        from agent.usage_pricing import CostResult
+        import hermes_cli.runtime_provider_custom as rpc
+
+        url = "http://localhost:4000/v1"
+        seen = []
+        monkeypatch.setattr(rpc, "find_custom_provider_identity", lambda b: "custom:litellm" if b == url else None)
+        monkeypatch.setattr(rp, "resolve_runtime_provider", lambda requested=None, **_: {"base_url": url, "api_key": "sk-cfg"})
+        monkeypatch.setattr(ins, "estimate_usage_cost", lambda *a, **k: seen.append(k.get("api_key")) or
+                            CostResult(amount_usd=None, status="unknown", source="none", label="n/a"))
+        ins._endpoint_api_key.cache_clear()
+        try:
+            ins._estimate_cost({"model": "m", "billing_provider": "custom", "billing_base_url": url})
+            ins._estimate_cost({"model": "m", "billing_provider": "custom", "billing_base_url": "https://other.example/v1"})
+        finally:
+            ins._endpoint_api_key.cache_clear()
+        assert seen == ["sk-cfg", ""]
 
 
     def test_cache_aware_usage(self):
