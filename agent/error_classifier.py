@@ -382,6 +382,12 @@ _TIMEOUT_MESSAGE_PATTERNS = (
     "upstream timed out",
 )
 
+# An upstream timeout relayed by a gateway as a 400 (LiteLLM in front of Fireworks answers
+# "Fireworks_aiException - {...ValueError: BackendConnectionTimeout: The request timed out.}"
+# after the backend gives up at 300 s). The request itself was fine; retrying it is correct,
+# and treating it as format_error aborted whole multi-call runs on one slow call.
+_RELAYED_TIMEOUT_400_PATTERNS = ("backendconnectiontimeout", "request timed out", "upstream timed out")
+
 # Connect/DNS failures from generic exception types with no status. EXCLUDES
 # mid-stream disconnects (_SERVER_DISCONNECT_PATTERNS may route large sessions
 # to compression; a never-established connection cannot be an overflow).
@@ -843,6 +849,8 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # mutation). Not gated on provider — OpenRouter proxies Anthropic errors.
     if status == 400 and "thinking" in msg and any(p in msg for p in _THINKING_MUTATION_WORDS):
         return _v(_R.thinking_signature)
+    if status == 400 and any(p in msg for p in _RELAYED_TIMEOUT_400_PATTERNS):
+        return _V_TIMEOUT
     # Anthropic long-context tier gate (429 "extra usage" + "long context").
     if status == 429 and "extra usage" in msg and "long context" in msg:
         return _v(_R.long_context_tier, should_compress=True)

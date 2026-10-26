@@ -481,6 +481,19 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.timeout
         assert result.retryable is True
 
+    def test_400_relaying_an_upstream_timeout_is_retryable_timeout(self):
+        """LiteLLM relays a Fireworks backend timeout as a 400. One slow call must be retried,
+        not abort the run as a format_error (cis-private review legs, 2026-10-25)."""
+        msg = (
+            "Error code: 400 - {'error': {'message': 'litellm.BadRequestError: Fireworks_aiException - "
+            "{\"error\":{\"message\":\"ValueError: BackendConnectionTimeout: The request timed out.\","
+            "\"type\":\"invalid_request_error\",\"code\":400}}', 'type': None, 'param': None, 'code': '400'}}"
+        )
+        e = MockAPIError(msg, status_code=400)
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
     def test_400_bad_request_still_non_retryable_format_error(self):
         """Guard the boundary: a genuine 400 Bad Request must remain a
         non-retryable format_error and must not be swept up by the 408 branch."""
